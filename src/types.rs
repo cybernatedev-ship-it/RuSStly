@@ -1,6 +1,14 @@
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
+pub struct SyncTarget {
+    pub id: i64,
+    pub label: String,
+    pub path: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct Feed {
     pub id: i64,
     pub url: String,

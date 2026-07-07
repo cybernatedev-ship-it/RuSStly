@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection, Result};
 
-use crate::types::{Episode, Feed, NewEpisode};
+use crate::types::{Episode, Feed, NewEpisode, SyncTarget};
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -30,6 +30,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sync_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL,
+            path TEXT NOT NULL
         );",
     )?;
     Ok(())
@@ -184,6 +189,51 @@ pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
         |row| row.get(0),
     )
     .ok()
+}
+
+pub fn migrate_sync_target(conn: &Connection) -> Result<()> {
+    if let Some(path) = get_setting(conn, "sync_target") {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sync_targets WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )?;
+        if count == 0 {
+            conn.execute(
+                "INSERT INTO sync_targets (label, path) VALUES (?1, ?2)",
+                params!["Default", path],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub fn get_sync_targets(conn: &Connection) -> Result<Vec<SyncTarget>> {
+    let mut stmt = conn.prepare("SELECT id, label, path FROM sync_targets")?;
+    let targets = stmt
+        .query_map([], |row| {
+            Ok(SyncTarget {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                path: row.get(2)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(targets)
+}
+
+pub fn add_sync_target(conn: &Connection, label: &str, path: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO sync_targets (label, path) VALUES (?1, ?2)",
+        params![label, path],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn remove_sync_target(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM sync_targets WHERE id = ?1", params![id])?;
+    Ok(())
 }
 
 pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {

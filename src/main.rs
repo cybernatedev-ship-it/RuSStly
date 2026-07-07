@@ -25,7 +25,6 @@ fn main() -> eframe::Result<()> {
     let data_path = data_dir();
     std::fs::create_dir_all(&data_path).ok();
 
-
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     let _guard = rt.enter();
 

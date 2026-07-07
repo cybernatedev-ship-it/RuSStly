@@ -4,7 +4,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Frame, Rounding, Slider};
+use notify_rust::Notification;
 use rusqlite::Connection;
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, MenuId};
+use tray_icon::TrayIconBuilder;
 
 use crate::db;
 use crate::download;
@@ -140,13 +143,22 @@ pub struct RuSStlyApp {
     player: Player,
     volume: f32,
     download_progress: HashMap<i64, f64>,
-    sync_target: String,
+    sync_targets: Vec<SyncTarget>,
+    new_sync_label: String,
+    new_sync_path: String,
     sync_status: String,
     client: reqwest::Client,
     rt_handle: tokio::runtime::Handle,
     expanded_episodes: HashSet<i64>,
     last_position_save: std::time::Instant,
     pending_sync_episodes: HashSet<i64>,
+
+    // Tray
+    _tray: Option<tray_icon::TrayIcon>,
+    tray_show_id: MenuId,
+    tray_quit_id: MenuId,
+    should_hide: bool,
+    should_quit: bool,
 
     // Settings
     show_settings: bool,
@@ -186,9 +198,8 @@ impl RuSStlyApp {
             .and_then(|id| db::get_episodes(&conn, id).ok())
             .unwrap_or_default();
 
-        let sync_target = db::get_setting(&conn, "sync_target").unwrap_or_else(|| {
-            home_dir().join("Podcasts").to_string_lossy().to_string()
-        });
+        let _ = db::migrate_sync_target(&conn);
+        let sync_targets = db::get_sync_targets(&conn).unwrap_or_default();
         let volume = db::get_setting(&conn, "volume")
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(1.0);
@@ -216,6 +227,10 @@ impl RuSStlyApp {
 
         let (tx, rx) = mpsc::channel();
 
+        let show_id: MenuId = "show".into();
+        let quit_id: MenuId = "quit".into();
+        let tray = create_tray_icon(&show_id, &quit_id);
+
         let mut app = RuSStlyApp {
             conn,
             feeds,
@@ -228,7 +243,9 @@ impl RuSStlyApp {
             player: Player::new(),
             volume,
             download_progress: HashMap::new(),
-            sync_target,
+            sync_targets,
+            new_sync_label: String::new(),
+            new_sync_path: String::new(),
             sync_status: String::new(),
             client: reqwest::Client::builder()
                 .user_agent("Mozilla/5.0 (compatible; RuSStly/0.1; +https://github.com/goldfang/russtly)")
@@ -241,6 +258,11 @@ impl RuSStlyApp {
             expanded_episodes: HashSet::new(),
             last_position_save: std::time::Instant::now(),
             pending_sync_episodes: HashSet::new(),
+            _tray: tray,
+            tray_show_id: show_id,
+            tray_quit_id: quit_id,
+            should_hide: false,
+            should_quit: false,
 
             show_settings: false,
             download_dir,
@@ -290,6 +312,17 @@ impl RuSStlyApp {
             self.episodes.clear();
         }
         self.compute_unplayed_counts();
+    }
+
+    fn find_episode_title(&self, episode_id: i64) -> String {
+        for feed in &self.feeds {
+            if let Ok(eps) = db::get_episodes(&self.conn, feed.id) {
+                if let Some(ep) = eps.iter().find(|e| e.id == episode_id) {
+                    return ep.title.clone();
+                }
+            }
+        }
+        String::new()
     }
 
     fn process_messages(&mut self) {
@@ -365,10 +398,14 @@ impl RuSStlyApp {
                     self.download_progress.remove(&episode_id);
                     let _ = db::set_episode_downloaded(&self.conn, episode_id, &path);
                     self.load_episodes();
+                    let title = self.find_episode_title(episode_id);
+                    let _ = send_notification("Download Complete", &title);
                 }
                 AppMessage::DownloadFailed { episode_id, error } => {
                     self.download_progress.remove(&episode_id);
                     self.add_feed_error = format!("Download failed: {}", error);
+                    let title = self.find_episode_title(episode_id);
+                    let _ = send_notification("Download Failed", &format!("{}: {}", title, error));
                 }
                 AppMessage::SyncResult {
                     episode_id,
@@ -670,14 +707,8 @@ impl eframe::App for RuSStlyApp {
                 }
 
                 ui.horizontal(|ui| {
-                    ui.label("Sync target:");
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.sync_target)
-                            .desired_width(300.0),
-                    );
-                    if resp.lost_focus() {
-                        let _ = db::set_setting(&self.conn, "sync_target", &self.sync_target);
-                    }
+                    let count = self.sync_targets.len();
+                    ui.label(format!("Sync targets: {}", count));
                 });
 
                 if !self.sync_status.is_empty() {
@@ -803,6 +834,7 @@ impl eframe::App for RuSStlyApp {
                                                 && !self
                                                     .pending_sync_episodes
                                                     .contains(&episode.id)
+                                                && !self.sync_targets.is_empty()
                                             {
                                                 if ui.small_button("Sync").clicked() {
                                                     self.pending_sync_episodes
@@ -819,37 +851,45 @@ impl eframe::App for RuSStlyApp {
                                                             .map(|f| f.title.clone())
                                                             .unwrap_or_default();
                                                         let source = PathBuf::from(dpath);
-                                                        let target =
-                                                            PathBuf::from(&self.sync_target);
+                                                        let targets = self.sync_targets.clone();
                                                         let ep_title = episode.title.clone();
                                                         let tx = self.tx.clone();
                                                         let ep_id = episode.id;
                                                         self.rt_handle.spawn(async move {
-                                                            let result = sync::sync_episode(
-                                                                &source,
-                                                                &target,
-                                                                &feed_title,
-                                                                &ep_title,
-                                                            );
-                                                            match result {
-                                                                Ok(p) => {
-                                                                    let _ = tx.send(
-                                                                        AppMessage::SyncResult {
-                                                                            episode_id: ep_id,
-                                                                            success: true,
-                                                                            message: p,
-                                                                        },
-                                                                    );
+                                                            let mut success_count = 0;
+                                                            let mut first_err = String::new();
+                                                            for target in &targets {
+                                                                let target_path = PathBuf::from(&target.path);
+                                                                match sync::sync_episode(
+                                                                    &source,
+                                                                    &target_path,
+                                                                    &feed_title,
+                                                                    &ep_title,
+                                                                ) {
+                                                                    Ok(_) => success_count += 1,
+                                                                    Err(e) => {
+                                                                        if first_err.is_empty() {
+                                                                            first_err = format!("{}: {}", target.label, e);
+                                                                        }
+                                                                    }
                                                                 }
-                                                                Err(e) => {
-                                                                    let _ = tx.send(
-                                                                        AppMessage::SyncResult {
-                                                                            episode_id: ep_id,
-                                                                            success: false,
-                                                                            message: e,
-                                                                        },
-                                                                    );
-                                                                }
+                                                            }
+                                                            if success_count == targets.len() {
+                                                                let _ = tx.send(
+                                                                    AppMessage::SyncResult {
+                                                                        episode_id: ep_id,
+                                                                        success: true,
+                                                                        message: format!("Copied to {} destination(s)", success_count),
+                                                                    },
+                                                                );
+                                                            } else {
+                                                                let _ = tx.send(
+                                                                    AppMessage::SyncResult {
+                                                                        episode_id: ep_id,
+                                                                        success: false,
+                                                                        message: first_err,
+                                                                    },
+                                                                );
                                                             }
                                                         });
                                                     }
@@ -1337,6 +1377,45 @@ impl eframe::App for RuSStlyApp {
                         });
 
                         ui.add_space(10.0);
+                        ui.heading("Sync Targets");
+                        ui.separator();
+
+                        let targets = self.sync_targets.clone();
+                        for target in &targets {
+                            ui.horizontal(|ui| {
+                                ui.label(&target.label);
+                                ui.label(egui::RichText::new(&target.path).size(11.0).color(Color32::GRAY));
+                                if ui.small_button("Remove").clicked() {
+                                    let _ = db::remove_sync_target(&self.conn, target.id);
+                                    self.sync_targets = db::get_sync_targets(&self.conn).unwrap_or_default();
+                                }
+                            });
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_sync_label)
+                                    .hint_text("Label")
+                                    .desired_width(100.0),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_sync_path)
+                                    .hint_text("/path/to/destination")
+                                    .desired_width(200.0),
+                            );
+                            if ui.button("Add").clicked() {
+                                let label = self.new_sync_label.clone();
+                                let path = self.new_sync_path.clone();
+                                if !label.is_empty() && !path.is_empty() {
+                                    let _ = db::add_sync_target(&self.conn, &label, &path);
+                                    self.sync_targets = db::get_sync_targets(&self.conn).unwrap_or_default();
+                                    self.new_sync_label.clear();
+                                    self.new_sync_path.clear();
+                                }
+                            }
+                        });
+
+                        ui.add_space(10.0);
                         ui.heading("Playback");
                         ui.separator();
 
@@ -1386,5 +1465,57 @@ impl eframe::App for RuSStlyApp {
                     });
                 });
         }
+
+        // Tray event handling
+        if let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == self.tray_show_id {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            } else if event.id == self.tray_quit_id {
+                self.should_quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
+        // Handle close request (user clicked X)
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.should_quit || self.download_progress.is_empty() {
+                
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+
+        if self.should_hide {
+            self.should_hide = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        if self.should_quit && !self.download_progress.is_empty() {
+            self.should_quit = false;
+            self.should_hide = true;
+        }
     }
+}
+
+fn create_tray_icon(show_id: &MenuId, quit_id: &MenuId) -> Option<tray_icon::TrayIcon> {
+    let show = MenuItem::with_id(show_id.clone(), "Show", true, None::<_>);
+    let quit = MenuItem::with_id(quit_id.clone(), "Quit", true, None::<_>);
+    let menu = Menu::with_items(&[&show, &quit]).ok()?;
+
+    TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("RuSStly")
+        .build()
+        .ok()
+}
+
+fn send_notification(summary: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
+    Notification::new()
+        .summary(summary)
+        .body(body)
+        .appname("RuSStly")
+        .show()?;
+    Ok(())
 }
