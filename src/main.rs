@@ -3,6 +3,7 @@ mod db;
 mod download;
 mod feed;
 mod icon;
+mod mtp;
 mod opml;
 mod playback;
 mod sync;

@@ -12,6 +12,7 @@ use tray_icon::TrayIconBuilder;
 use crate::db;
 use crate::download;
 use crate::feed;
+use crate::mtp;
 use crate::opml;
 use crate::playback::Player;
 use crate::sync;
@@ -182,6 +183,13 @@ pub struct RuSStlyApp {
     // Concurrency control
     download_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     max_episodes: usize,
+
+    // MTP
+    mtp_enabled: bool,
+    mtp_path: String,
+    mtp_devices: Vec<mtp::MtpDeviceInfo>,
+    mtp_scan_error: String,
+    mtp_browser: Option<mtp::MtpBrowser>,
 }
 
 impl RuSStlyApp {
@@ -225,6 +233,12 @@ impl RuSStlyApp {
         let max_episodes = db::get_setting(&conn, "max_episodes")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(200);
+
+        let mtp_enabled = db::get_setting(&conn, "mtp_sync")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let mtp_path = db::get_setting(&conn, "mtp_path")
+            .unwrap_or_else(|| "Podcasts".to_string());
 
         let (tx, rx) = mpsc::channel();
 
@@ -283,6 +297,12 @@ impl RuSStlyApp {
 
             download_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             max_episodes,
+
+            mtp_enabled,
+            mtp_path,
+            mtp_devices: Vec::new(),
+            mtp_scan_error: String::new(),
+            mtp_browser: None,
         };
 
         app.compute_unplayed_counts();
@@ -878,6 +898,8 @@ impl eframe::App for RuSStlyApp {
                                                         let ep_title = episode.title.clone();
                                                         let tx = self.tx.clone();
                                                         let ep_id = episode.id;
+                                                        let mtp_enabled = self.mtp_enabled;
+                                                        let mtp_path = self.mtp_path.clone();
                                                         self.rt_handle.spawn(async move {
                                                             let mut success_count = 0;
                                                             let mut first_err = String::new();
@@ -897,7 +919,32 @@ impl eframe::App for RuSStlyApp {
                                                                     }
                                                                 }
                                                             }
-                                                            if success_count == targets.len() {
+                                                            if mtp_enabled {
+                                                                match mtp::sync_episode_to_all(
+                                                                    &source,
+                                                                    &feed_title,
+                                                                    &ep_title,
+                                                                    &mtp_path,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    Ok(count) => {
+                                                                        success_count += count as usize;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        if first_err.is_empty() {
+                                                                            first_err = format!("MTP: {}", e);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            let all_ok = if mtp_enabled {
+                                                                success_count > 0
+                                                                    && first_err.is_empty()
+                                                            } else {
+                                                                success_count == targets.len()
+                                                            };
+                                                            if all_ok {
                                                                 let _ = tx.send(
                                                                     AppMessage::SyncResult {
                                                                         episode_id: ep_id,
@@ -1437,6 +1484,138 @@ impl eframe::App for RuSStlyApp {
                                 }
                             }
                         });
+
+                        ui.add_space(10.0);
+                        ui.heading("MTP Sync");
+                        ui.separator();
+
+                        if ui.checkbox(&mut self.mtp_enabled, "Sync to connected MTP devices").clicked() {
+                            let val = if self.mtp_enabled { "true" } else { "false" };
+                            let _ = db::set_setting(&self.conn, "mtp_sync", val);
+                        }
+
+                        ui.add_enabled_ui(self.mtp_enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Path on device:");
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.mtp_path)
+                                        .hint_text("Podcasts")
+                                        .desired_width(180.0),
+                                );
+                                if resp.changed() {
+                                    let _ = db::set_setting(&self.conn, "mtp_path", &self.mtp_path);
+                                }
+                            });
+                        });
+
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Scan MTP devices").clicked() {
+                                self.mtp_devices = mtp::scan_devices();
+                                self.mtp_browser = None;
+                                if self.mtp_devices.is_empty() {
+                                    self.mtp_scan_error = "No MTP devices found".to_string();
+                                } else {
+                                    self.mtp_scan_error.clear();
+                                }
+                            }
+                            if !self.mtp_scan_error.is_empty() {
+                                ui.label(egui::RichText::new(&self.mtp_scan_error).color(Color32::RED));
+                            }
+                        });
+
+                        if let Some(ref mut browser) = self.mtp_browser {
+                            // ── Folder browser panel ──
+                            ui.group(|ui| {
+                                // Storage selector (SD card vs Internal)
+                                let storages = browser.storage_info_list();
+                                let mut switch_to: Option<usize> = None;
+                                if storages.len() > 1 {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Storage:");
+                                        let current = browser.current_storage();
+                                        for st in &storages {
+                                            let free_gb = st.free_space as f64 / 1_000_000_000.0;
+                                            let total_gb = st.total_capacity as f64 / 1_000_000_000.0;
+                                            let text = format!(
+                                                "{}  {:.0}/{:.0} GB",
+                                                st.label, free_gb, total_gb
+                                            );
+                                            if ui
+                                                .selectable_label(st.index == current, &text)
+                                                .clicked()
+                                                && st.index != current
+                                            {
+                                                switch_to = Some(st.index);
+                                            }
+                                        }
+                                    });
+                                }
+                                if let Some(idx) = switch_to {
+                                    browser.select_storage(idx);
+                                }
+                                // Navigation
+                                ui.horizontal(|ui| {
+                                    ui.strong("Browse: ");
+                                    let path = browser.current_path();
+                                    ui.label(if path.is_empty() { "(root)" } else { &path });
+                                    if ui.small_button("Root").clicked() {
+                                        browser.go_root();
+                                    }
+                                    if !browser.path_segments.is_empty() {
+                                        if ui.small_button("Up").clicked() {
+                                            browser.up();
+                                        }
+                                    }
+                                });
+                                if !browser.error.is_empty() {
+                                    ui.label(egui::RichText::new(&browser.error).color(Color32::RED));
+                                }
+                                let mut selected: Option<String> = None;
+                                for item in &browser.items {
+                                    if !item.is_folder {
+                                        continue;
+                                    }
+                                    let resp = ui.selectable_label(false, &item.name);
+                                    if resp.double_clicked() {
+                                        selected = Some(item.name.clone());
+                                    }
+                                }
+                                if let Some(ref name) = selected {
+                                    browser.enter(name);
+                                }
+                            });
+                            if ui.small_button("Use this folder").clicked() {
+                                self.mtp_path = browser.current_path();
+                                let _ = db::set_setting(&self.conn, "mtp_path", &self.mtp_path);
+                                self.mtp_browser = None;
+                            }
+                            if ui.small_button("Close browser").clicked() {
+                                self.mtp_browser = None;
+                            }
+                        } else if !self.mtp_devices.is_empty() && self.mtp_enabled {
+                            for dev in &self.mtp_devices {
+                                ui.horizontal(|ui| {
+                                    let label = dev
+                                        .product
+                                        .as_deref()
+                                        .or_else(|| dev.manufacturer.as_deref())
+                                        .unwrap_or("MTP device");
+                                    ui.label(label);
+                                    if let Some(ref serial) = dev.serial_number {
+                                        ui.label(egui::RichText::new(serial).size(11.0).color(Color32::GRAY));
+                                    }
+                                    if ui.small_button("Browse").clicked() {
+                                        match mtp::MtpBrowser::open(dev.location_id) {
+                                            Ok(b) => self.mtp_browser = Some(b),
+                                            Err(e) => self.mtp_scan_error = e,
+                                        }
+                                    }
+                                });
+                            }
+                        } else if self.mtp_enabled {
+                            ui.label(egui::RichText::new("No MTP devices detected. Connect a device and click Scan.")
+                                .color(Color32::YELLOW));
+                        }
 
                         ui.add_space(10.0);
                         ui.heading("Playback");
