@@ -146,7 +146,6 @@ jobs:
           path: artifacts/*
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: [package-linux, package-macos, package-windows]
     runs-on: ubuntu-latest
     permissions:
@@ -158,6 +157,7 @@ jobs:
           cp -r *-packages/* release-assets/
           ls -la release-assets/
       - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: release-assets/*
           generate_release_notes: true
