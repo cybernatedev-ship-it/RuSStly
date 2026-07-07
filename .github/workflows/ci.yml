@@ -33,7 +33,6 @@ jobs:
         run: cargo check
 
   package:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: [check]
     name: package-${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -78,7 +77,7 @@ jobs:
       - name: Build AppImage
         if: matrix.name == 'linux'
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${GITHUB_REF_NAME#v}"  # strips "v" prefix if present
           wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           chmod +x linuxdeploy-x86_64.AppImage
           export APPIMAGE_EXTRACT_AND_RUN=1
@@ -99,7 +98,7 @@ jobs:
       - name: Build .dmg
         if: matrix.name == 'macos'
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${GITHUB_REF_NAME#v}"  # strips "v" prefix if present
           mkdir -p "RuSStly.app/Contents/MacOS"
           cp target/release/russtly "RuSStly.app/Contents/MacOS/"
           printf '%s\n' \
@@ -128,7 +127,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifacts
-          $ver = "$env:GITHUB_REF_NAME".Substring(1)
+          $ref = "$env:GITHUB_REF_NAME"
+          $ver = if ($ref -match '^v') { $ref.Substring(1) } else { $ref }
           Compress-Archive -Path target/release/russtly.exe,README.md `
             -DestinationPath "artifacts/russtly-${ver}-x86_64.zip"
 
