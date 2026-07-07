@@ -347,6 +347,7 @@ impl RuSStlyApp {
     }
 
     fn init_tray(&mut self) {
+        #[cfg(all(unix, not(target_os = "macos")))]
         if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland") || gtk::init().is_err() {
             return;
         }
