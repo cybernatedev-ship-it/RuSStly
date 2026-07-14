@@ -5,4 +5,4 @@ Exec=russtly
 Icon=russtly
 Terminal=false
 Type=Application
-Categories=AudioVideo;Audio;Podcast;
+Categories=AudioVideo;Audio;X-Podcast;
